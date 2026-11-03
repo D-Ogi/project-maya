@@ -5823,9 +5823,13 @@ bool Glm5Model::fast_dsa(int il, int64_t p, std::string& err) {
     d.eps = g.norm_eps;
     gf::dsa_prep(d, s);
     if (F->prof_on) F->mark("dsa_prep");
+    // Latent Sparse Attention (glm_lsa.cu): this position's index key into the ring, the cells by LSA's selection
+    // (the native indexer's caches are kept up to date above; its query and scores are not needed)
+    const bool lsa = lsa_on(il);
+    if (lsa) lsa_keys(il, cur_seq_, F->kv_raw, g.kv_lora, 1, p, s);
     // every pool selected (a context of at most idx_top_k positions): no scores, so no indexer query either
     const int pool_done = (int) ((p + 1) / g.idx_kpool);
-    const bool all = pool_done <= g.top_pools_max() && gf::dsa_select_all_on();
+    const bool all = !lsa && pool_done <= g.top_pools_max() && gf::dsa_select_all_on();
     gf::MvJob j2[2];
     j2[0] = {Ly.q_b.q, F->qr_q, F->qr, F->q, nullptr, 1.0f, Ly.q_b.type, g.q_lora, g.n_head * g.qk_nope};
     j2[1] = Ly.idx_q_b_x.q != nullptr
@@ -5833,23 +5837,33 @@ bool Glm5Model::fast_dsa(int il, int64_t p, std::string& err) {
                             g.idx_heads * g.idx_key}
                 : gf::MvJob{Ly.idx_q_b, nullptr, F->qr, F->iq, nullptr, 1.0f, gf::kTypeBF16, g.q_lora,
                             g.idx_heads * g.idx_key};
-    if (!gf::mv(j2, all ? 1 : 2, s)) { err = "glm fast: dsa q"; return false; }
+    if (!gf::mv(j2, all || lsa ? 1 : 2, s)) { err = "glm fast: dsa q"; return false; }
     if (F->prof_on) F->mark("dsa_q_mv");
     if (dumps) {
         fast_dump(s, "dsa_qr-" + std::to_string(il), F->qr, g.q_lora);
         fast_dump(s, "dsa_q-" + std::to_string(il), F->q, (int64_t) g.n_head * g.qk_nope);
         fast_dump(s, "dsa_iq-" + std::to_string(il), F->iq, (int64_t) g.idx_heads * g.idx_key);
     }
-    if (pool_done > 0 && !all) {
-        gf::dsa_score(F->iq, state_ + dsa_pool_[(size_t) il], F->iw, g.idx_key, g.idx_heads, pool_done,
-                      F->score, s, true);
-        if (F->prof_on) F->mark("dsa_score");
+    int n_sel;
+    if (lsa) {
+        const uint16_t* rows = kv_streamed(kv_, il) ? (const uint16_t*) kv_->host[(size_t) il] : lat;
+        if (!lsa_select(il, cur_seq_, p, 1, F->q, nullptr, (int64_t) g.n_head * g.qk_nope, nullptr, 0, F->cells, 0,
+                        nullptr, rows, err, s))
+            return false;
+        n_sel = lsa_width();
+        if (F->prof_on) F->mark("lsa_select");
+    } else {
+        if (pool_done > 0 && !all) {
+            gf::dsa_score(F->iq, state_ + dsa_pool_[(size_t) il], F->iw, g.idx_key, g.idx_heads, pool_done,
+                          F->score, s, true);
+            if (F->prof_on) F->mark("dsa_score");
+        }
+        const int top_pools = std::min(g.top_pools_max(), pool_done);
+        n_sel = g.idx_kpool * top_pools + (g.idx_select_tail ? g.idx_kpool - 1 : 0);
+        if (all) gf::dsa_select_all(pool_done, g.idx_kpool, n_sel, (int) p, F->cells, s);
+        else gf::dsa_select(F->score, pool_done, g.idx_kpool, top_pools, n_sel, (int) p, F->cells, s);
+        if (F->prof_on) F->mark("dsa_select");
     }
-    const int top_pools = std::min(g.top_pools_max(), pool_done);
-    const int n_sel = g.idx_kpool * top_pools + (g.idx_select_tail ? g.idx_kpool - 1 : 0);
-    if (all) gf::dsa_select_all(pool_done, g.idx_kpool, n_sel, (int) p, F->cells, s);
-    else gf::dsa_select(F->score, pool_done, g.idx_kpool, top_pools, n_sel, (int) p, F->cells, s);
-    if (F->prof_on) F->mark("dsa_select");
     // KV streaming: the selected blocks into VRAM slots, the attention reading the selection in slot rows
     const int* cells = kv_attend_cells(kv_, il, lat, F->cells, n_sel, F->slot_cells, s);
     if (F->prof_on && cells != F->cells) F->mark("kv_resolve");
@@ -7670,6 +7684,7 @@ bool Glm5Model::ckpt_restore(int slot, std::string& err) {
         }
         m->pos_ = pos;
         m->mtp_hx_pos_ = -1;   // (head_x is not the checkpoint's)
+        m->lsa_invalidate(m->cur_seq_, pos);   // LSA: the buckets are the latents' now in the cache, rebuilt from them
     }
     // the drafter's positions from here on belong to the previous continuation (as snapshot_restore)
     if (cap_d_ != nullptr) cap_d_->reset(pos_);
@@ -7882,6 +7897,8 @@ bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& e
         err = "the snapshot did not restore";
         return false;
     }
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())   // LSA: another conversation's latents
+        m->lsa_invalidate(m->cur_seq_, m->pos_);
     return true;
 }
 
@@ -8077,6 +8094,8 @@ bool Glm5Model::slot_load(const std::vector<uint8_t>& data, int64_t n_pos, std::
         err = "the snapshot did not restore";
         return false;
     }
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())   // LSA: another conversation's latents
+        m->lsa_invalidate(m->cur_seq_, m->pos_);
     return true;
 }
 

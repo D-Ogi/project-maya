@@ -153,6 +153,7 @@ bool Glm5Model::seq_alloc_arenas(std::string& err) {
             c.kv = kv_stream_make(kv_cells, ctx, err);
             if (c.kv == nullptr && !err.empty()) return false;
         }
+        if (lsa_ != nullptr && !lsa_seq_alloc(s, ctx, err)) return false;   // LSA: its key ring and buckets
     }
     // every sequence's snapshot (its recurrent states and the open key pool: the prompt cache, PAUSE) now as well:
     // made on demand, after the expert pool had taken the card, only the first found room

@@ -2616,6 +2616,11 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 d.T = tn;
                 d.eps = g.norm_eps;
                 gb::dsa_prep(d, s);
+                // Latent Sparse Attention (glm_lsa.cu): the sub-batch's index keys into the ring; the selection
+                // below from the absorbed queries (the native indexer's caches and pools are kept; its query,
+                // scores and selection are not run)
+                const bool lsa = lsa_on(il);
+                if (lsa) lsa_keys(il, cur_seq_, B.kv_raw, g.kv_lora, tn, pt, s);
                 // the pools completed inside this sub-batch: pool pi ends at position (pi + 1) * kpool - 1
                 const int kp = g.idx_kpool;
                 const int pool_lo = (pt + kp) / kp - 1, pool_hi = (pt + tn) / kp - 1;
@@ -2624,20 +2629,24 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                                  state_ + dsa_pool_[(size_t) il], g.idx_key, kp, pool_lo, pool_hi - pool_lo + 1, s,
                                  ik_ring_);
                 hgemm_q(Ly.q_b, g.n_head * g.qk_nope, g.q_lora, B.qr16, g.q_lora, B.q, g.n_head * g.qk_nope, tn, 0.0f);
-                if (Ly.idx_q_b_x.q != nullptr)   // an EXL3 pack quantizes it
+                if (lsa)
+                    ;   // (no indexer query)
+                else if (Ly.idx_q_b_x.q != nullptr)   // an EXL3 pack quantizes it
                     hgemm_q(Ly.idx_q_b_x, g.idx_heads * g.idx_key, g.q_lora, B.qr16, g.q_lora, B.iq,
                             g.idx_heads * g.idx_key, tn, 0.0f);
                 else
                     sgemm_bf16(Ly.idx_q_b, g.idx_heads * g.idx_key, g.q_lora, B.qr, g.q_lora, B.iq,
                                g.idx_heads * g.idx_key, tn, 1.0f);
                 S->mark("dsa_proj", s);
-                const int max_vis = (pt + tn) / kp;
-                if (max_vis > g.top_pools_max())
-                    gb::dsa_score(B.iq, state_ + dsa_pool_[(size_t) il], B.iw, g.idx_key, g.idx_heads, pt, kp, tn,
-                                  max_vis, B.score, B.score_ld, s);
-                gb::dsa_select(B.score, B.score_ld, pt, kp, g.top_pools_max(), g.idx_select_tail, tn, g.n_sel_max(),
-                               B.cells, B.n_sel, s);
-                S->mark("dsa_index", s);
+                if (!lsa) {
+                    const int max_vis = (pt + tn) / kp;
+                    if (max_vis > g.top_pools_max())
+                        gb::dsa_score(B.iq, state_ + dsa_pool_[(size_t) il], B.iw, g.idx_key, g.idx_heads, pt, kp, tn,
+                                      max_vis, B.score, B.score_ld, s);
+                    gb::dsa_select(B.score, B.score_ld, pt, kp, g.top_pools_max(), g.idx_select_tail, tn,
+                                   g.n_sel_max(), B.cells, B.n_sel, s);
+                    S->mark("dsa_index", s);
+                }
                 // q_abs[t][h] = wk_b[h] (kv_lora x qk_nope) . q[t][h]
 #if defined(STRATA_USE_HIP)
                 // FP16 products; q is packed per head into B.attn's space and the context into B.q_abs's (both idle there)
@@ -2667,6 +2676,15 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         "q_abs");
                 }
                 S->mark("dsa_qabs", s);
+                if (lsa) {   // LSA: the buckets of every block the sub-batch closes, then each token's selection
+#if defined(STRATA_USE_HIP)
+                    if (f16) { err = "glm prefill: LSA needs the F32 absorbed queries (STRATA_GLM_MLA_F16=0)"; return false; }
+#endif
+                    if (!lsa_select(il, cur_seq_, pt, tn, nullptr, B.q_abs, (int64_t) g.n_head * g.kv_lora, B.score,
+                                    B.score_ld, B.cells, g.n_sel_max(), B.n_sel, lat, err, s))
+                        return false;
+                    S->mark("lsa_index", s);
+                }
 #if defined(STRATA_USE_HIP)
                 if (use_f16q)
                     gb::mla_attn_f16q((const uint16_t*) B.q_abs, lat, B.cells,

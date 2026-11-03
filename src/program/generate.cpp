@@ -272,6 +272,7 @@ struct Options {
     bool prefill_auto = false;
     std::string prefill_arg;           ///< `--prefill` as given (the GLM engine reads it as STRATA_GLM_PREFILL)
     std::string dflash;                ///< `--dflash`: a DFlash2 draft GGUF for the GLM engine (STRATA_GLM_DFLASH)
+    std::string lsa;                   ///< `--lsa`: a Latent Sparse Attention map (.lsa) for the GLM engine (STRATA_GLM_LSA)
     bool no_split_rows = false;        ///< plan v0.3 P4 A/B: one whole expert per pool thread
     /// Plan v0.3 P5: the prompt path borrows the top expert-cache slots for its buffers and refills them after
     /// the prompt (default); `--no-prefill-borrow` reserves the buffers' VRAM for the whole session instead.
@@ -408,6 +409,11 @@ void usage() {
                  "                       all of it in VRAM. A context of N cells or fewer is not streamed. With\n"
                  "                       --glm-pack: N positions of each DSA layer's latent cache\n"
                  "                       (MAYA_GLM_KV_RESIDENT)\n"
+                 "  --lsa FILE|off       (--glm-pack) Latent Sparse Attention: the DSA layers select the cells their\n"
+                 "                       attention reads by the map's learned index space (Ward buckets of the latent\n"
+                 "                       keys, top-p buckets expanded to top-k keys, the window and the sinks) instead\n"
+                 "                       of the model's own indexer.  FILE: an .lsa map (tools: lsa_convert.py from\n"
+                 "                       `lsa distill export`'s torch file); off: the native indexer\n"
                  "  --kv-streaming on|off  KV streaming as a switch (the setup writes `on` into the config): on keeps\n"
                  "                       --kv-resident's N cells in VRAM, 32768 when it gives none; off keeps all\n"
                  "                       of the KV in VRAM whatever --kv-resident says\n"
@@ -1076,6 +1082,8 @@ static int glm_pack_generate(const Options& o) {
     if (!o.prefill_arg.empty()) set_env("STRATA_GLM_PREFILL", o.prefill_arg.c_str());
     // the DFlash2 drafter (--dflash, else STRATA_GLM_DFLASH): loaded with the model, on the device of its head
     if (!o.dflash.empty()) set_env("STRATA_GLM_DFLASH", o.dflash.c_str());
+    // Latent Sparse Attention (--lsa FILE | off, else STRATA_GLM_LSA): the DSA layers' selection by the map's index space
+    if (!o.lsa.empty()) set_env("STRATA_GLM_LSA", o.lsa.c_str());
     // --spec-follow / --spec-follow-save (else STRATA_GLM_SPEC_FOLLOW / _SAVE): read below, once the vocabulary is known
     if (!o.spec_follow.empty()) set_env("STRATA_GLM_SPEC_FOLLOW", o.spec_follow.c_str());
     if (!o.spec_follow_save.empty()) set_env("STRATA_GLM_SPEC_FOLLOW_SAVE", o.spec_follow_save.c_str());
@@ -4720,6 +4728,7 @@ int main(int argc, char** argv) {
         else if (a == "--spec-split") o.spec_split = true;
         else if (a == "--layer-split") o.layer_split = next("--layer-split");
         else if (a == "--dflash") o.dflash = next("--dflash");
+        else if (a == "--lsa") o.lsa = next("--lsa");
         else if (a == "--split-device") o.split_device = next("--split-device");
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") o.serve = true;

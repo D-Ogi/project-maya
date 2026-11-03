@@ -482,6 +482,9 @@ bool Glm5Model::fast_dsa_window(int il, int64_t p0, int t0, int T, std::string& 
         gf::dsa_prep(d, s);
     }
     mark("dsa_prep");
+    // Latent Sparse Attention (glm_lsa.cu): the window's index keys into the ring; the selections below
+    const bool lsa = lsa_on(il);
+    if (lsa) lsa_keys(il, cur_seq_, W.kv_raw + (size_t) t0 * g.kv_lora, g.kv_lora, T, p0 + t0, s);
     gf::MvJob j2[2];
     const void* qrq0 = (const uint8_t*) W.qr_q + (size_t) t0 * W.qrq_s;
     const float* qr0 = W.qr + (size_t) t0 * g.q_lora;
@@ -493,7 +496,7 @@ bool Glm5Model::fast_dsa_window(int il, int64_t p0, int t0, int T, std::string& 
                         g.idx_heads * g.idx_key}, W.qrq_s, g.q_lora, (int64_t) g.idx_heads * g.idx_key)
                 : cols({Ly.idx_q_b, nullptr, qr0, iq0, nullptr, 1.0f, gf::kTypeBF16, g.q_lora, g.idx_heads * g.idx_key},
                        0, g.q_lora, (int64_t) g.idx_heads * g.idx_key);
-    if (!gf::mv(j2, 2, s)) { err = "glm window: dsa q"; return false; }
+    if (!gf::mv(j2, lsa ? 1 : 2, s)) { err = "glm window: dsa q"; return false; }
     mark("dsa_q_mv");
     // the absorbed MLA: wk_b . q of every token at once, each token's attention over its own selected cells, then
     // wv_b . ctx of every token at once (mla()'s arithmetic; the head-wise weights read once, not T times).
@@ -514,19 +517,37 @@ bool Glm5Model::fast_dsa_window(int il, int64_t p0, int t0, int T, std::string& 
     thread_local std::vector<int> nsel;
     nsel.clear();
     const bool rows = batched && W.cells != nullptr && !kv_streamed(kv_, il);
+    // LSA: the queries from the absorbed ones when the window has them, else folded from the plain ones; with the
+    // rows' buffer every token's selection in one go, else each token's into F->cells right before its attention
+    const bool lsa_abs = lsa && batched;
+    const uint16_t* const lsa_rows = kv_streamed(kv_, il) ? (const uint16_t*) kv_->host[(size_t) il] : lat;
+    if (lsa && rows &&
+        !lsa_select(il, cur_seq_, p0 + t0, T, lsa_abs ? nullptr : W.q + (size_t) t0 * qd,
+                    lsa_abs ? W.q_abs + (size_t) t0 * ad : nullptr, lsa_abs ? ad : qd, nullptr, 0, W.cells, nsm, nullptr,
+                    lsa_rows, err, s))
+        return false;
     for (int t = t0; t < t0 + T; ++t) {
         const int64_t p = p0 + t;
-        const float* iq = W.iq + (size_t) t * g.idx_heads * g.idx_key;
-        const int pool_done = (int) ((p + 1) / g.idx_kpool);
-        const bool all = pool_done <= g.top_pools_max() && gf::dsa_select_all_on();   // (as fast_dsa)
-        if (pool_done > 0 && !all)
-            gf::dsa_score(iq, state_ + dsa_pool_[(size_t) il], W.iw + (size_t) t * g.idx_heads, g.idx_key, g.idx_heads,
-                          pool_done, F->score, s);
-        const int top_pools = std::min(g.top_pools_max(), pool_done);
-        const int n_sel = g.idx_kpool * top_pools + (g.idx_select_tail ? g.idx_kpool - 1 : 0);
+        int n_sel;
         int* const sel = rows ? W.cells + (size_t) (t - t0) * nsm : F->cells;
-        if (all) gf::dsa_select_all(pool_done, g.idx_kpool, n_sel, (int) p, sel, s);
-        else gf::dsa_select(F->score, pool_done, g.idx_kpool, top_pools, n_sel, (int) p, sel, s);
+        if (lsa) {
+            n_sel = lsa_width();
+            if (!rows && !lsa_select(il, cur_seq_, p, 1, lsa_abs ? nullptr : W.q + (size_t) t * qd,
+                                     lsa_abs ? W.q_abs + (size_t) t * ad : nullptr, lsa_abs ? ad : qd, nullptr, 0, sel, 0,
+                                     nullptr, lsa_rows, err, s))
+                return false;
+        } else {
+            const float* iq = W.iq + (size_t) t * g.idx_heads * g.idx_key;
+            const int pool_done = (int) ((p + 1) / g.idx_kpool);
+            const bool all = pool_done <= g.top_pools_max() && gf::dsa_select_all_on();   // (as fast_dsa)
+            if (pool_done > 0 && !all)
+                gf::dsa_score(iq, state_ + dsa_pool_[(size_t) il], W.iw + (size_t) t * g.idx_heads, g.idx_key,
+                              g.idx_heads, pool_done, F->score, s);
+            const int top_pools = std::min(g.top_pools_max(), pool_done);
+            n_sel = g.idx_kpool * top_pools + (g.idx_select_tail ? g.idx_kpool - 1 : 0);
+            if (all) gf::dsa_select_all(pool_done, g.idx_kpool, n_sel, (int) p, sel, s);
+            else gf::dsa_select(F->score, pool_done, g.idx_kpool, top_pools, n_sel, (int) p, sel, s);
+        }
         if (rows) {
             nsel.push_back(n_sel);
             continue;

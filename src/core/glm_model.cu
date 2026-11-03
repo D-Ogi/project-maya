@@ -643,6 +643,7 @@ Glm5Model::~Glm5Model() {
     }
     rows_destroy();
     mtpw_destroy();
+    lsa_free();
     fast_destroy();
     pen_free();
     if (!stage_workers_.empty()) {
@@ -852,6 +853,7 @@ void Glm5Model::reset() {
     }
     pos_ = 0;
     mtp_hx_pos_ = -1;   // (head_x holds no position of the new sequence)
+    lsa_invalidate(cur_seq_, 0);   // LSA: a new sequence's keys and buckets from position 0
     dflash_reset();   // a new sequence: the drafter's cached positions belong to the old one
     if (split_next_) {
         split_next_->reset();
@@ -3044,6 +3046,8 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         err = "pack: an EXL3 model runs on the fast path only (unset MAYA_GLM_SLOW)";
         return false;
     }
+    // Latent Sparse Attention (STRATA_GLM_LSA, glm_lsa.cu): the map read now, before anything is sized by n_sel_max()
+    if (!lsa_load(max_ctx, err)) return false;
     const auto keep16 = [&](const Row& r, const strata::TensorInfo* t) {
         return fast_mode_ && r.kind == "4" && t->elements() >= 65536;
     };
@@ -3641,6 +3645,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             return false;
     }
     if (fast_mode_ && !fast_setup(err)) return false;
+    if (fast_mode_ && !lsa_fold_all(err)) return false;   // LSA: the folds k_b . W_Q, now that the layer weights are bound
     reset();
     return true;
 }

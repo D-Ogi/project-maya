@@ -84,9 +84,16 @@ struct Glm5Geometry {
     int norm_w = 1;
     float swiglu_exp = 10.0f, swiglu_shexp = 10.0f;
 
+    // Latent Sparse Attention (src/core/glm_lsa.cu, --lsa): the cells a selection lists when LSA runs (0: never) - every
+    // `cells` buffer is sized by n_sel_max(), the wider of the two selections
+    int lsa_n_sel = 0;
+
     int d_inner() const { return kda_head_dim * n_head; }
     int top_pools_max() const { return idx_top_k / idx_kpool; }
-    int n_sel_max() const { return idx_top_k + (idx_select_tail ? idx_kpool - 1 : 0); }
+    int n_sel_max() const {
+        const int native = idx_top_k + (idx_select_tail ? idx_kpool - 1 : 0);
+        return lsa_n_sel > native ? lsa_n_sel : native;
+    }
     bool is_recr(int il) const { return n_head_kv[(size_t) il] == 0; }
 
     static bool from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
@@ -623,6 +630,30 @@ public:
     uint64_t kv_stage_bytes_ = 0;                            // the prompt path's staging copy (the first sequence's)
     void kv_stream_reset_maps();                             // nothing resident (reset, slot_load)
     float* snap_pool_ = nullptr;
+    // ---- Latent Sparse Attention (src/core/glm_lsa.cu; STRATA_GLM_LSA=<map>, generate's --lsa): the trunk's DSA layers
+    // the map covers select their attention cells by LSA's learned index space instead of the native indexer's scores
+    // (the native indexer still runs: its caches stay valid).  The NextN block keeps the native selection.
+    struct Lsa;
+    Lsa* lsa_ = nullptr;
+    std::vector<uint8_t> lsa_on_;                          // per layer: LSA selects its cells
+    bool lsa_on(int il) const { return il >= 0 && (size_t) il < lsa_on_.size() && lsa_on_[(size_t) il] != 0; }
+    int lsa_width() const;                                 // cells a selection lists (0: no LSA)
+    bool lsa_load(int64_t max_ctx, std::string& err);      // load_pack, after the geometry: the map, this part's layers
+    bool lsa_fold_all(std::string& err);                   // fast_setup, after the layer weights: the folds k_b . W_Q
+    bool lsa_seq_alloc(int seq, int64_t ctx, std::string& err);   // a sequence's key ring and buckets (before the pool)
+    void lsa_invalidate(int seq, int64_t pos);             // its latents were replaced (a checkpoint, a slot, a reset)
+    void lsa_free();
+    // the index keys of T positions p0.. from kv_a's raw rows (rows of ld floats), into the sequence's ring
+    void lsa_keys(int il, int seq, const float* kv_raw, int64_t ld, int T, int64_t p0, cudaStream_t s);
+    // the selections of T tokens at p0.. (the buckets of every block they see built first): from the plain queries q
+    // (rows of ld_q) or the absorbed ones q_abs (rows of ld_q, n_head x kv_lora each); scores: T rows of ld_scores
+    // scratch (null: the engine's own, T <= 16); cells: T rows of ld_cells, lsa_width() written each, -1 padded; n_sel
+    // (may be null): each row's count.  lat_rows: the layer's latent rows by position (the identity cache, the prompt
+    // path's staging copy, or KV streaming's host copy) for a rebuild after a restore.
+    bool lsa_select(int il, int seq, int64_t p0, int T, const float* q, const float* q_abs, int64_t ld_q, float* scores,
+                    int64_t ld_scores, int* cells, int64_t ld_cells, int* n_sel, const uint16_t* lat_rows,
+                    std::string& err, cudaStream_t s);
+    void lsa_stats(uint64_t& blocks, uint64_t& from_lat) const;
     std::vector<int> dsa_layers() const;                   // this half's DSA layers (NextN block first), slot order
     void snap_pool_copy(bool restore);
     int64_t snap_pos_ = -1;

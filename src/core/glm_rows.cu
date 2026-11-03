@@ -510,7 +510,10 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
         d.p = (int) rw[i].p;
         d.eps = g.norm_eps;
         gf::dsa_prep(d, s);
+        // LSA (glm_lsa.cu): the row's index key into its sequence's ring
+        if (lsa_on(il)) lsa_keys(il, rw[i].seq, rows(S->kv_raw, g.kv_lora, i), g.kv_lora, 1, rw[i].p, s);
     }
+    const bool lsa = lsa_on(il);
     gf::MvJob j2[2];
     j2[0] = {Ly.q_b.q, S->qr_q, S->qr, S->q, nullptr, 1.0f, Ly.q_b.type, g.q_lora, g.n_head * g.qk_nope};
     j2[1] = Ly.idx_q_b_x.q != nullptr   // (an EXL3 pack quantizes the indexer's q_b)
@@ -518,13 +521,14 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
                             g.idx_heads * g.idx_key}
                 : gf::MvJob{Ly.idx_q_b, nullptr, S->qr, S->iq, nullptr, 1.0f, gf::kTypeBF16, g.q_lora,
                             g.idx_heads * g.idx_key};
-    if (!mv(j2, 2, "dsa q")) return false;
+    if (!mv(j2, lsa ? 1 : 2, "dsa q")) return false;
     // STRATA_GLM_ROWS_ATTN: the attention of every row in one launch (each row's selection into its own buffers).  A
     // verify window's rows of one conversation (consecutive rows) on a streamed layer share its slot pool: one resolve
     // over all their selections then (a resolve never evicts a block it names), not one a row - a row's resolve could
     // evict a block the row before it still has to read.  Rows of one conversation that are not consecutive: one by one
     const int64_t qd = (int64_t) g.n_head * g.qk_nope, ad = (int64_t) g.n_head * g.kv_lora, nsm = g.n_sel_max();
-    bool attn = rows_attn_on() && n > 1 && S->apart != nullptr && g.v_head % 32 == 0 && gf::mla_rows_ok(g.kv_lora);
+    bool attn = rows_attn_on() && n > 1 && S->apart != nullptr && g.v_head % 32 == 0 && gf::mla_rows_ok(g.kv_lora) &&
+                !lsa;   // (LSA selects a row at a time: the token path's kernels)
     int run0[gf::kMaxMvNt];   // the first row of each row's run of consecutive rows of its conversation
     for (int i = 0; i < n; ++i) {
         run0[i] = i > 0 && rw[i - 1].seq == rw[i].seq ? run0[i - 1] : i;
@@ -553,7 +557,9 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
         const float* pooled = rw[i].state + (*rw[i].dsa_pool)[(size_t) il];
         const bool all = pool_done <= g.top_pools_max() && gf::dsa_select_all_on();   // (as fast_dsa)
         float* const score = attn ? S->ascore + (size_t) i * S->ascore_n : F->score;
-        if (pool_done > 0 && !all && small) {
+        if (lsa) {
+            // (LSA: no indexer scores)
+        } else if (pool_done > 0 && !all && small) {
             sc.iq[n_sc] = rows(S->iq, (int64_t) g.idx_heads * g.idx_key, i);
             sc.pooled[n_sc] = pooled;
             sc.iw[n_sc] = rows(S->iw, g.idx_heads, i);
@@ -583,10 +589,20 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
             a_nsel[i] = n_sel;
             continue;
         }
-        if (all) gf::dsa_select_all(pool_done, g.idx_kpool, n_sel, (int) p, sel, s);
-        else gf::dsa_select(F->score, pool_done, g.idx_kpool, top_pools, n_sel, (int) p, sel, s);
-        const int* cells = kv_attend_cells(rw[i].kv, il, lat, F->cells, n_sel, F->slot_cells, s);
-        gf::mla(rows(S->q, qd, i), Ly.k_b, Ly.v_b, lat, cells, n_sel, g.n_head,
+        int n_sel_row = n_sel;
+        if (lsa) {
+            const uint16_t* lrows = kv_streamed(rw[i].kv, il) ? (const uint16_t*) rw[i].kv->host[(size_t) il] : lat;
+            if (!lsa_select(il, rw[i].seq, p, 1, rows(S->q, qd, i), nullptr, qd, nullptr, 0, sel, 0, nullptr, lrows,
+                            err, s))
+                return false;
+            n_sel_row = lsa_width();
+        } else if (all) {
+            gf::dsa_select_all(pool_done, g.idx_kpool, n_sel, (int) p, sel, s);
+        } else {
+            gf::dsa_select(F->score, pool_done, g.idx_kpool, top_pools, n_sel, (int) p, sel, s);
+        }
+        const int* cells = kv_attend_cells(rw[i].kv, il, lat, F->cells, n_sel_row, F->slot_cells, s);
+        gf::mla(rows(S->q, qd, i), Ly.k_b, Ly.v_b, lat, cells, n_sel_row, g.n_head,
                 g.qk_nope, g.kv_lora, g.v_head, rows_q(S->attn_q, (int64_t) g.n_head * g.v_head, i), s,
                 lat_q8_, nullptr, true);   // (a decode row: the token path's kernels)
     }
